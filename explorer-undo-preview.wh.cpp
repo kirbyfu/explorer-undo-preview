@@ -29,14 +29,26 @@ menu, and the ribbon) and first shows what will happen, for example:
 
 Choose **Undo** to go ahead or **Cancel** to leave everything as it is.
 
+In the folder background menu (right-click empty space):
+
+- **Undo/Redo say what they'll do**: "Undo Move: 8 items back to Downloads"
+  instead of "Undo Move". The ribbon's tooltip uses the same text.
+- **Undo history ▸**: lists the last entries of the undo and redo stacks.
+  Picking one undoes (or redoes) it *and everything newer*, after a
+  confirmation that lists every step. Explorer's undo is a stack, so an older
+  step can't be undone on its own.
+
 ## How it works
 Explorer keeps its undo history in the shell's shared "Desktop Undo Manager"
 (a standard `IOleUndoManager`). The mod reads the top entry. Each entry
 serializes itself by value, and the mod decodes that data to get the
 operation type, item names, and source and destination folders.
 
-It hooks one function, `shell32!_UndoThread`, which every undo and redo
-path in Explorer goes through.
+Hooks in shell32: `_UndoThread` (every undo/redo path goes through it),
+`GetUndoRedoText` (menu and tooltip text), the `CContextMenuOnHMENU`
+constructor (adds the submenu to the background menu), and
+`CDefView::_OnCommand` (handles submenu clicks). The last
+three are optional; if they aren't found, only the confirmation works.
 
 Developed and tested on Windows 10 22H2 (build 19045).
 */
@@ -53,6 +65,14 @@ Developed and tested on Windows 10 22H2 (build 19045).
   $description: When enabled, pressing Enter or Space in the dialog cancels instead of undoing
 - maxItems: 12
   $name: Maximum item names to list
+- richMenuText: true
+  $name: Descriptive Undo/Redo menu text
+  $description: 'Turns "Undo Move" in the folder background menu into e.g. "Undo Move: 8 items back to Downloads" (also used for the ribbon tooltip)'
+- historyMenu: true
+  $name: '"Undo history" submenu'
+  $description: 'Adds an "Undo history" submenu after Undo/Redo in the folder background menu. Picking an entry undoes it and everything newer, after confirmation.'
+- historyEntries: 10
+  $name: Entries per list in the history submenu
 */
 // ==/WindhawkModSettings==
 
@@ -577,7 +597,7 @@ inline const wchar_t* OpVerb(DWORD op) {
         case kOpCopy: return L"copy";
         case kOpDelete: return L"delete";
         case kOpRename: return L"rename";
-        case kOpNew: return L"new item";
+        case kOpNew: return L"creation";
         case kOpApplyProperties: return L"property change";
         default: return L"file operation";
     }
@@ -618,6 +638,93 @@ inline Preview Describe(const Entry& entry, bool redo, size_t maxNames) {
 }
 
 // ---------------------------------------------------------------------------
+// One-line summaries (menu items, tooltips)
+// ---------------------------------------------------------------------------
+
+inline std::wstring Ellipsize(const std::wstring& s, size_t max) {
+    if (s.size() <= max || max < 2)
+        return s;
+    return s.substr(0, max - 1) + L"…";
+}
+
+inline std::wstring Leaf(const std::wstring& path) {
+    if (path.empty())
+        return L"?";
+    std::wstring p = path;
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/'))
+        p.pop_back();
+    const wchar_t* leaf = PathFindFileNameW(p.c_str());
+    return Ellipsize(*leaf ? leaf : p.c_str(), 28);
+}
+
+inline std::wstring Quoted(const std::wstring& name) {
+    return L"'" + Ellipsize(name, 36) + L"'";
+}
+
+// e.g. "Move: 8 items back to Downloads", "Rename: 'b.txt' -> 'a.txt'".
+inline std::wstring ShortSummary(const Entry& entry, bool redo) {
+    std::vector<Group> groups = GroupItems(entry);
+    if (groups.empty())
+        return entry.description.empty() ? L"last operation"
+                                          : entry.description;
+    if (groups.size() > 1)
+        return Plural(groups.size(), L"operation", L"operations") + L" on " +
+               Plural(entry.items.size(), L"item", L"items");
+    const Group& g = groups[0];
+    size_t n = g.items.size();
+    auto what = [&](bool preferNew) {
+        return n == 1 ? Quoted(ShownName(*g.items[0], preferNew))
+                      : Plural(n, L"item", L"items");
+    };
+    switch (g.op) {
+        case kOpMove:
+            return redo ? L"Move: " + what(false) + L" to " + Leaf(g.dstParent)
+                        : L"Move: " + what(true) + L" back to " +
+                              Leaf(g.srcParent);
+        case kOpCopy:
+            return redo ? L"Copy: " + what(false) + L" to " + Leaf(g.dstParent)
+                        : L"Copy: delete " +
+                              (n == 1 ? L"copy " + what(true)
+                                      : Plural(n, L"copy", L"copies")) +
+                              L" in " + Leaf(g.dstParent);
+        case kOpDelete:
+            return redo ? L"Delete: " + what(false)
+                        : L"Delete: restore " + what(false);
+        case kOpRename:
+            if (n == 1) {
+                const Item& it = *g.items[0];
+                return redo ? L"Rename: " + Quoted(it.srcName) + L" → " +
+                                  Quoted(it.dstName)
+                            : L"Rename: " + Quoted(it.dstName) + L" → " +
+                                  Quoted(it.srcName);
+            }
+            return L"Rename: " + Plural(n, L"item", L"items");
+        case kOpNew:
+            return redo ? L"New: " + what(true) : L"New: delete " + what(true);
+        case kOpApplyProperties:
+            return L"Properties: " + what(false);
+        default:
+            return L"Operation on " + what(true);
+    }
+}
+
+// Menu text treats '&' as a mnemonic marker.
+inline std::wstring EscapeAmpersands(const std::wstring& s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        if (c == L'&')
+            r += L'&';
+        r += c;
+    }
+    return r;
+}
+
+// Two entries are the same undo step if they serialize identically.
+inline bool SameEntry(const Entry& a, const Entry& b) {
+    return !a.raw.empty() && a.raw == b.raw;
+}
+
+// ---------------------------------------------------------------------------
 // Confirmation dialog
 // ---------------------------------------------------------------------------
 
@@ -650,17 +757,29 @@ struct DialogOptions {
     size_t maxNames = 12;
 };
 
-// Returns true if the undo/redo should go ahead.
-inline bool ConfirmTop(bool redo, HWND owner, const DialogOptions& opt,
-                       std::wstring* logLine = nullptr) {
-    std::vector<Entry> entries;
-    HRESULT hr = ReadStack(redo, 1, entries);
-    if (FAILED(hr) || entries.empty()) {
-        if (logLine)
-            *logLine = L"nothing to preview (stack empty or unavailable)";
-        return true;  // let Explorer handle it (it beeps when empty)
+// Asks whether to undo (or redo) the given steps, newest first. Returns true
+// if the user chose to go ahead.
+inline bool ConfirmSteps(const std::vector<Entry>& steps, bool redo,
+                         HWND owner, const DialogOptions& opt,
+                         std::wstring* logLine = nullptr) {
+    if (steps.empty())
+        return true;
+    Preview p;
+    if (steps.size() == 1) {
+        p = Describe(steps[0], redo, opt.maxNames);
+    } else {
+        p.headline = std::wstring(redo ? L"Redo " : L"Undo ") +
+                     std::to_wstring(steps.size()) + L" steps?";
+        size_t perStep = opt.maxNames / steps.size();
+        if (perStep < 3)
+            perStep = 3;
+        for (size_t i = 0; i < steps.size(); i++) {
+            if (!p.details.empty())
+                p.details += L"\n\n";
+            p.details += std::to_wstring(i + 1) + L". " +
+                         Describe(steps[i], redo, perStep).details;
+        }
     }
-    Preview p = Describe(entries[0], redo, opt.maxNames);
     if (logLine)
         *logLine = p.headline + L"\n" + p.details;
 
@@ -692,6 +811,19 @@ inline bool ConfirmTop(bool redo, HWND owner, const DialogOptions& opt,
     return pressed == kActionId;
 }
 
+// Confirms the step Ctrl+Z (or Ctrl+Y) would perform next.
+inline bool ConfirmTop(bool redo, HWND owner, const DialogOptions& opt,
+                       std::wstring* logLine = nullptr) {
+    std::vector<Entry> entries;
+    HRESULT hr = ReadStack(redo, 1, entries);
+    if (FAILED(hr) || entries.empty()) {
+        if (logLine)
+            *logLine = L"nothing to preview (stack empty or unavailable)";
+        return true;  // let Explorer handle it (it beeps when empty)
+    }
+    return ConfirmSteps(entries, redo, owner, opt, logLine);
+}
+
 }  // namespace undopreview
 
 #ifndef UNDO_PREVIEW_STANDALONE
@@ -706,6 +838,9 @@ struct {
     bool confirmRedo;
     bool cancelIsDefault;
     int maxItems;
+    bool richMenuText;
+    bool historyMenu;
+    int historyEntries;
 } g_settings;
 
 // shell32!_UndoThread(void* undo): thread proc started by UndoFromSite /
@@ -723,16 +858,21 @@ static HWND OwnerWindow() {
     return nullptr;
 }
 
+static undopreview::DialogOptions DialogOpts() {
+    undopreview::DialogOptions opt;
+    opt.cancelIsDefault = g_settings.cancelIsDefault;
+    opt.maxNames = g_settings.maxItems > 0 ? (size_t)g_settings.maxItems : 1;
+    return opt;
+}
+
 DWORD __cdecl UndoThread_Hook(void* param) {
     bool redo = param == nullptr;
     bool confirm = redo ? g_settings.confirmRedo : g_settings.confirmUndo;
     if (confirm) {
         HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        undopreview::DialogOptions opt;
-        opt.cancelIsDefault = g_settings.cancelIsDefault;
-        opt.maxNames = g_settings.maxItems > 0 ? (size_t)g_settings.maxItems : 1;
         std::wstring log;
-        bool proceed = undopreview::ConfirmTop(redo, OwnerWindow(), opt, &log);
+        bool proceed =
+            undopreview::ConfirmTop(redo, OwnerWindow(), DialogOpts(), &log);
         if (SUCCEEDED(hrInit))
             CoUninitialize();
         Wh_Log(L"%s: %s -> %s", redo ? L"Redo" : L"Undo", log.c_str(),
@@ -743,11 +883,264 @@ DWORD __cdecl UndoThread_Hook(void* param) {
     return UndoThread_Original(param);
 }
 
+// ---------------------------------------------------------------------------
+// Descriptive Undo/Redo text
+// ---------------------------------------------------------------------------
+// shell32!GetUndoRedoText(buffer, cch, textType, undo) builds the label of
+// the folder background menu's Undo/Redo items ("&Undo Move\tCtrl+Z"), their
+// status bar help text, and the command bar tooltip.
+using GetUndoRedoText_t = HRESULT(__cdecl*)(WCHAR*, UINT, int, BOOL);
+GetUndoRedoText_t GetUndoRedoText_Original;
+
+HRESULT __cdecl GetUndoRedoText_Hook(WCHAR* buffer, UINT cch, int type,
+                                     BOOL undo) {
+    HRESULT hr = GetUndoRedoText_Original(buffer, cch, type, undo);
+    if (FAILED(hr) || !g_settings.richMenuText || !buffer || cch < 24 ||
+        !buffer[0])
+        return hr;
+
+    std::vector<undopreview::Entry> entries;
+    if (FAILED(undopreview::ReadStack(!undo, 1, entries)) || entries.empty() ||
+        entries[0].items.empty())
+        return hr;
+
+    std::wstring original = buffer;
+    size_t tab = original.find(L'\t');
+    std::wstring accel = tab == std::wstring::npos ? L"" : original.substr(tab);
+    bool menuText = original[0] == L'&' || !accel.empty();
+    std::wstring prefix = undo ? L"Undo " : L"Redo ";
+    if (original[0] == L'&')
+        prefix = L"&" + prefix;
+
+    std::wstring summary = undopreview::ShortSummary(entries[0], !undo);
+    if (menuText)
+        summary = undopreview::EscapeAmpersands(summary);
+    size_t used = prefix.size() + accel.size() + 1;
+    if (used + 8 > cch)
+        return hr;
+    summary = undopreview::Ellipsize(summary, cch - used);
+    std::wstring text = prefix + summary + accel;
+    lstrcpynW(buffer, text.c_str(), (int)cch);
+    return hr;
+}
+
+// ---------------------------------------------------------------------------
+// "Undo history" submenu
+// ---------------------------------------------------------------------------
+// Background menu command IDs live in 0x7000-0x7FFF (shell32 menu resource
+// 215 uses up to 0x7B03); this range is unused there.
+constexpr UINT kHistoryParentId = 0x7E00;
+constexpr UINT kHistoryFirstId = 0x7E01;
+constexpr UINT kHistoryLastId = 0x7E7F;
+constexpr UINT kUndoItemId = 0x701B;  // SFVIDM_EDIT_UNDO
+constexpr UINT kRedoItemId = 0x7020;
+
+struct HistoryAction {
+    UINT id;
+    bool redo;
+    size_t steps;
+};
+
+// Snapshot taken when the menu was built, so a click acts on exactly the
+// entries that were shown.
+struct {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<undopreview::Entry> undo, redo;
+    std::vector<HistoryAction> actions;
+} g_history;
+
+using ContextMenuOnHMENU_ctor_t = void*(__cdecl*)(void*, HMENU, HWND);
+ContextMenuOnHMENU_ctor_t ContextMenuOnHMENU_ctor_Original;
+
+using DefView_OnCommand_t = __int64(__cdecl*)(void*, unsigned __int64,
+                                               __int64);
+DefView_OnCommand_t DefView_OnCommand_Original;
+
+static int FindItemPos(HMENU menu, UINT id) {
+    int count = GetMenuItemCount(menu);
+    for (int i = 0; i < count; i++)
+        if (GetMenuItemID(menu, i) == id)
+            return i;
+    return -1;
+}
+
+static void AddHistoryMenu(HMENU menu, UINT idAdjust) {
+    if (!DefView_OnCommand_Original)
+        return;  // couldn't hook the command handler; clicks would do nothing
+    if (GetMenuState(menu, kHistoryParentId, MF_BYCOMMAND) != (UINT)-1)
+        DeleteMenu(menu, kHistoryParentId, MF_BYCOMMAND);
+
+    int pos = FindItemPos(menu, kRedoItemId + idAdjust);
+    if (pos < 0)
+        pos = FindItemPos(menu, kUndoItemId + idAdjust);
+    if (pos < 0)
+        return;
+
+    size_t limit = g_settings.historyEntries < 1    ? 1
+                   : g_settings.historyEntries > 50 ? 50
+                                                    : g_settings.historyEntries;
+    std::vector<undopreview::Entry> undo, redo;
+    undopreview::ReadStack(false, limit, undo);
+    undopreview::ReadStack(true, limit, redo);
+    if (undo.empty() && redo.empty())
+        return;
+
+    UINT needed = (UINT)(undo.size() + redo.size() + 2);
+    if (kHistoryFirstId + needed > kHistoryLastId)
+        return;
+    for (UINT id = kHistoryParentId; id <= kHistoryFirstId + needed; id++) {
+        if (GetMenuState(menu, id, MF_BYCOMMAND) != (UINT)-1) {
+            Wh_Log(L"Menu ID 0x%X already in use; not adding history", id);
+            return;
+        }
+    }
+
+    HMENU sub = CreatePopupMenu();
+    std::vector<HistoryAction> actions;
+    UINT id = kHistoryFirstId;
+    auto addList = [&](const std::vector<undopreview::Entry>& list, bool redo) {
+        AppendMenuW(sub, MF_STRING | MF_GRAYED, id++,
+                    redo ? L"Redo (next first)" : L"Undo (newest first)");
+        for (size_t i = 0; i < list.size(); i++) {
+            std::wstring label =
+                std::to_wstring(i + 1) + L".  " +
+                undopreview::EscapeAmpersands(
+                    undopreview::ShortSummary(list[i], redo));
+            if (i == 0)
+                label += redo ? L"\tCtrl+Y" : L"\tCtrl+Z";
+            AppendMenuW(sub, MF_STRING, id, label.c_str());
+            actions.push_back({id, redo, i + 1});
+            id++;
+        }
+    };
+    if (!undo.empty())
+        addList(undo, false);
+    if (!redo.empty()) {
+        if (!undo.empty())
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        addList(redo, true);
+    }
+
+    WCHAR title[] = L"Undo &history";
+    MENUITEMINFOW mii = {sizeof(mii)};
+    mii.fMask = MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
+    mii.wID = kHistoryParentId;
+    mii.hSubMenu = sub;
+    mii.dwTypeData = title;
+    if (!InsertMenuItemW(menu, pos + 1, TRUE, &mii)) {
+        DestroyMenu(sub);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_history.lock);
+    g_history.undo = std::move(undo);
+    g_history.redo = std::move(redo);
+    g_history.actions = std::move(actions);
+    ReleaseSRWLockExclusive(&g_history.lock);
+}
+
+// CContextMenuOnHMENU(HMENU, HWND) wraps the folder view's background menu
+// (built by CDefView::_Create_BackgrndHMENU, Undo/Redo already set up) in an
+// IContextMenu. Its QueryContextMenu renumbers every item (submenus too) and
+// InvokeCommand sends WM_COMMAND with the original ID back to the view,
+// which is where DefView_OnCommand_Hook picks up the history items.
+void* __cdecl ContextMenuOnHMENU_ctor_Hook(void* pThis, HMENU menu,
+                                           HWND hwnd) {
+    if (g_settings.historyMenu && menu)
+        AddHistoryMenu(menu, 0);  // no-op unless the menu has Undo/Redo
+    return ContextMenuOnHMENU_ctor_Original(pThis, menu, hwnd);
+}
+
+struct HistoryJob {
+    bool redo;
+    std::vector<undopreview::Entry> steps;
+};
+
+// Performs the steps one at a time with Explorer's own undo routine, checking
+// before each one that the top of the stack is the entry that was shown.
+static DWORD WINAPI HistoryJobThread(void* param) {
+    HistoryJob* job = (HistoryJob*)param;
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    for (size_t i = 0; i < job->steps.size(); i++) {
+        std::vector<undopreview::Entry> top;
+        undopreview::ReadStack(job->redo, 1, top);
+        if (top.empty() || !undopreview::SameEntry(top[0], job->steps[i])) {
+            std::wstring msg =
+                L"The undo history changed, so the remaining steps were not "
+                L"performed.\n\nCompleted " +
+                std::to_wstring(i) + L" of " +
+                std::to_wstring(job->steps.size()) + L" steps.";
+            MessageBoxW(nullptr, msg.c_str(), L"Undo history",
+                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+            break;
+        }
+        UndoThread_Original(job->redo ? nullptr : (void*)1);
+    }
+    if (SUCCEEDED(hrInit))
+        CoUninitialize();
+    delete job;
+    return 0;
+}
+
+static bool HandleHistoryCommand(UINT id) {
+    auto job = new HistoryJob();
+    bool found = false;
+    AcquireSRWLockShared(&g_history.lock);
+    for (const HistoryAction& a : g_history.actions) {
+        if (a.id != id)
+            continue;
+        const auto& list = a.redo ? g_history.redo : g_history.undo;
+        if (a.steps <= list.size()) {
+            job->redo = a.redo;
+            job->steps.assign(list.begin(), list.begin() + a.steps);
+            found = true;
+        }
+        break;
+    }
+    ReleaseSRWLockShared(&g_history.lock);
+    if (!found) {
+        delete job;
+        return false;
+    }
+
+    std::wstring log;
+    bool proceed = undopreview::ConfirmSteps(job->steps, job->redo,
+                                             OwnerWindow(), DialogOpts(), &log);
+    Wh_Log(L"History %s x%zu: %s", job->redo ? L"redo" : L"undo",
+           job->steps.size(), proceed ? L"proceed" : L"cancelled");
+    if (!proceed) {
+        delete job;
+        return true;
+    }
+    HANDLE thread = CreateThread(nullptr, 0, HistoryJobThread, job, 0, nullptr);
+    if (thread)
+        CloseHandle(thread);
+    else
+        delete job;
+    return true;
+}
+
+// CDefView::_OnCommand(wParam, lParam): WM_COMMAND handler of the folder
+// view; background menu picks arrive here with their menu IDs.
+__int64 __cdecl DefView_OnCommand_Hook(void* pThis, unsigned __int64 wParam,
+                                       __int64 lParam) {
+    UINT id = LOWORD(wParam);
+    if (id >= kHistoryFirstId && id <= kHistoryLastId) {
+        Wh_Log(L"History command 0x%X", id);
+        if (HandleHistoryCommand(id))
+            return 0;
+    }
+    return DefView_OnCommand_Original(pThis, wParam, lParam);
+}
+
 static void LoadSettings() {
     g_settings.confirmUndo = Wh_GetIntSetting(L"confirmUndo");
     g_settings.confirmRedo = Wh_GetIntSetting(L"confirmRedo");
     g_settings.cancelIsDefault = Wh_GetIntSetting(L"cancelIsDefault");
     g_settings.maxItems = Wh_GetIntSetting(L"maxItems");
+    g_settings.richMenuText = Wh_GetIntSetting(L"richMenuText");
+    g_settings.historyMenu = Wh_GetIntSetting(L"historyMenu");
+    g_settings.historyEntries = Wh_GetIntSetting(L"historyEntries");
 }
 
 BOOL Wh_ModInit() {
@@ -767,12 +1160,35 @@ BOOL Wh_ModInit() {
             (void*)UndoThread_Hook,
             false,
         },
+        // Optional: the menu features switch off if these aren't found.
+        {
+            {L"long __cdecl GetUndoRedoText(unsigned short *,unsigned int,int,int)"},
+            (void**)&GetUndoRedoText_Original,
+            (void*)GetUndoRedoText_Hook,
+            true,
+        },
+        {
+            {L"public: __cdecl CContextMenuOnHMENU::CContextMenuOnHMENU(struct HMENU__ *,struct HWND__ *)"},
+            (void**)&ContextMenuOnHMENU_ctor_Original,
+            (void*)ContextMenuOnHMENU_ctor_Hook,
+            true,
+        },
+        {
+            {L"private: __int64 __cdecl CDefView::_OnCommand(unsigned __int64,__int64)"},
+            (void**)&DefView_OnCommand_Original,
+            (void*)DefView_OnCommand_Hook,
+            true,
+        },
     };
     if (!WindhawkUtils::HookSymbols(shell32, shell32Hooks,
                                     ARRAYSIZE(shell32Hooks))) {
         Wh_Log(L"Failed to hook shell32!_UndoThread");
         return FALSE;
     }
+    Wh_Log(L"Hooks: GetUndoRedoText=%d CContextMenuOnHMENU=%d _OnCommand=%d",
+           GetUndoRedoText_Original != nullptr,
+           ContextMenuOnHMENU_ctor_Original != nullptr,
+           DefView_OnCommand_Original != nullptr);
     return TRUE;
 }
 

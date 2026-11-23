@@ -14,6 +14,11 @@ Move 8 items back
                                    [ Undo ]  [ Cancel ]
 ```
 
+In the folder background menu (right-click empty space), Undo and Redo say
+what they'll do ("Undo Move: 8 items back to Downloads"), and an
+**Undo history ▸** submenu lists recent undo and redo entries. Picking an
+entry undoes or redoes it and everything newer, after confirming.
+
 ## Install
 
 1. Install Windhawk.
@@ -35,6 +40,16 @@ Move 8 items back
 - Every Explorer undo or redo path (Ctrl+Z, Ctrl+Y, context menu, ribbon) goes
   through `shell32!_UndoThread(void* undo)`. The mod hooks it and shows the
   preview before calling the original.
+- Menu features: `shell32!GetUndoRedoText` builds the "Undo Move" label
+  (and the ribbon tooltip). The background menu (Undo/Redo are IDs `0x701B`
+  and `0x7020`) is wrapped by `CContextMenuOnHMENU(HMENU, HWND)`; the mod
+  adds the submenu there (IDs `0x7E00`–`0x7E7F`). That wrapper renumbers
+  items and sends `WM_COMMAND` with the original ID back to the view, where
+  `CDefView::_OnCommand` catches the history clicks. (`_InitEditUndoRedo` is
+  a static function whose public symbol has no decorated name, so Windhawk
+  can't hook it.)
+  Multi-step undo calls the original `_UndoThread` once per step, and before
+  each step checks that the top entry is still the one that was shown.
 
 The format was worked out from `windows.storage.dll` and `shell32.dll` public
 symbols, version 10.0.19041.7802 (Windows 10 22H2). It could change in other
@@ -48,7 +63,8 @@ builds. If decoding fails, the dialog says so and still lets you choose.
 | Rename | ✅ | test rename |
 | Delete (Recycle Bin) | ✅ | real entry and a test delete |
 | Redo of move/rename/delete | ✅ | test entries |
-| Copy, New folder/file | text written, not yet exercised | – |
+| New folder/file | ✅ | real Explorer entries |
+| Copy | text written, not yet exercised | – |
 
 ## Test tool
 
@@ -60,6 +76,7 @@ undo-peek --redo     # list the redo stack
 undo-peek --items    # raw decoded fields per item
 undo-peek --raw      # hex dump of each serialized entry
 undo-peek --dialog   # show the confirmation dialog for the top entry (doesn't undo)
+undo-peek --menu <folder>   # dump that folder's background context menu items
 ```
 
 Build it with `tools/build.ps1 -Clang <path to llvm-mingw clang++.exe>`.
