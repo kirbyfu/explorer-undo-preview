@@ -20,9 +20,10 @@ different window minutes ago. The right-click menu only says "Undo Move".
 This mod intercepts Explorer's undo and redo (Ctrl+Z, Ctrl+Y, the right-click
 menu, and the ribbon) and first shows what will happen, for example:
 
-> **Undo: move 3 items back?**
-> From: `D:\Archive\Old`
-> Back to: `C:\Work\Reports`
+> **Undo move of 3 items?**
+> Move 3 items back
+> from: `D:\Archive\Old`
+> back to: `C:\Work\Reports`
 > • Q1.xlsx
 > • Q2.xlsx
 > • Notes
@@ -40,15 +41,15 @@ In the folder background menu (right-click empty space):
 
 ## How it works
 Explorer keeps its undo history in the shell's shared "Desktop Undo Manager"
-(a standard `IOleUndoManager`). The mod reads the top entry. Each entry
-serializes itself by value, and the mod decodes that data to get the
-operation type, item names, and source and destination folders.
+(a standard `IOleUndoManager`). Each entry serializes itself by value, and the
+mod decodes that data to get the operation type, item names, and source and
+destination folders.
 
 Hooks in shell32: `_UndoThread` (every undo/redo path goes through it),
 `GetUndoRedoText` (menu and tooltip text), the `CContextMenuOnHMENU`
 constructor (adds the submenu to the background menu), and
-`CDefView::_OnCommand` (handles submenu clicks). The last
-three are optional; if they aren't found, only the confirmation works.
+`CDefView::_OnCommand` (handles submenu clicks). The last three are optional;
+if they aren't found, only the confirmation works.
 
 Developed and tested on Windows 10 22H2 (build 19045).
 */
@@ -90,10 +91,8 @@ Developed and tested on Windows 10 22H2 (build 19045).
 #include <string>
 #include <vector>
 
-// ============================================================================
-// Core: read and decode Explorer's undo stack. No Windhawk dependency, so the
-// standalone test tool (tools/undo-peek.cpp) can include this file directly.
-// ============================================================================
+// Everything in this namespace is independent of Windhawk; tools/undo-peek.cpp
+// includes this file with UNDO_PREVIEW_STANDALONE defined.
 namespace undopreview {
 
 // Shell's session-wide undo manager (LocalServer32, hosted by Explorer).
@@ -152,7 +151,7 @@ struct Entry {
     std::wstring description;  // IOleUndoUnit::GetDescription (often empty)
     bool decoded = false;      // the whole blob was understood
     std::wstring problem;      // why decoding stopped, if it did
-    std::vector<BYTE> raw;     // serialized unit (for debugging)
+    std::vector<BYTE> raw;     // serialized unit
 };
 
 class Reader {
@@ -447,10 +446,6 @@ inline HRESULT ReadStack(bool redo, size_t maxEntries,
     return hr;
 }
 
-// ---------------------------------------------------------------------------
-// Turning decoded entries into text
-// ---------------------------------------------------------------------------
-
 inline std::wstring Plural(size_t n, const wchar_t* one, const wchar_t* many) {
     return std::to_wstring(n) + L" " + (n == 1 ? one : many);
 }
@@ -489,8 +484,8 @@ inline std::vector<Group> GroupItems(const Entry& entry) {
 }
 
 struct Preview {
-    std::wstring headline;  // short, e.g. "Undo: move 3 items back?"
-    std::wstring details;   // multi-line body
+    std::wstring headline;  // e.g. "Undo move of 3 items?"
+    std::wstring details;
 };
 
 inline void AppendNames(std::wstring& out, const Group& g, bool preferNew,
@@ -637,10 +632,6 @@ inline Preview Describe(const Entry& entry, bool redo, size_t maxNames) {
     return p;
 }
 
-// ---------------------------------------------------------------------------
-// One-line summaries (menu items, tooltips)
-// ---------------------------------------------------------------------------
-
 inline std::wstring Ellipsize(const std::wstring& s, size_t max) {
     if (s.size() <= max || max < 2)
         return s;
@@ -661,7 +652,7 @@ inline std::wstring Quoted(const std::wstring& name) {
     return L"'" + Ellipsize(name, 36) + L"'";
 }
 
-// e.g. "Move: 8 items back to Downloads", "Rename: 'b.txt' -> 'a.txt'".
+// One line for menus and tooltips, e.g. "Move: 8 items back to Downloads".
 inline std::wstring ShortSummary(const Entry& entry, bool redo) {
     std::vector<Group> groups = GroupItems(entry);
     if (groups.empty())
@@ -723,10 +714,6 @@ inline std::wstring EscapeAmpersands(const std::wstring& s) {
 inline bool SameEntry(const Entry& a, const Entry& b) {
     return !a.raw.empty() && a.raw == b.raw;
 }
-
-// ---------------------------------------------------------------------------
-// Confirmation dialog
-// ---------------------------------------------------------------------------
 
 using TaskDialogIndirect_t = HRESULT(WINAPI*)(const TASKDIALOGCONFIG*,
                                               int*, int*, BOOL*);
@@ -827,9 +814,6 @@ inline bool ConfirmTop(bool redo, HWND owner, const DialogOptions& opt,
 }  // namespace undopreview
 
 #ifndef UNDO_PREVIEW_STANDALONE
-// ============================================================================
-// Windhawk mod: hook shell32!_UndoThread
-// ============================================================================
 
 #include <windhawk_utils.h>
 
@@ -870,22 +854,16 @@ DWORD __cdecl UndoThread_Hook(void* param) {
     bool confirm = redo ? g_settings.confirmRedo : g_settings.confirmUndo;
     if (confirm) {
         HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        std::wstring log;
         bool proceed =
-            undopreview::ConfirmTop(redo, OwnerWindow(), DialogOpts(), &log);
+            undopreview::ConfirmTop(redo, OwnerWindow(), DialogOpts());
         if (SUCCEEDED(hrInit))
             CoUninitialize();
-        Wh_Log(L"%s: %s -> %s", redo ? L"Redo" : L"Undo", log.c_str(),
-               proceed ? L"proceed" : L"cancelled");
         if (!proceed)
             return 0;
     }
     return UndoThread_Original(param);
 }
 
-// ---------------------------------------------------------------------------
-// Descriptive Undo/Redo text
-// ---------------------------------------------------------------------------
 // shell32!GetUndoRedoText(buffer, cch, textType, undo) builds the label of
 // the folder background menu's Undo/Redo items ("&Undo Move\tCtrl+Z"), their
 // status bar help text, and the command bar tooltip.
@@ -924,9 +902,6 @@ HRESULT __cdecl GetUndoRedoText_Hook(WCHAR* buffer, UINT cch, int type,
     return hr;
 }
 
-// ---------------------------------------------------------------------------
-// "Undo history" submenu
-// ---------------------------------------------------------------------------
 // Background menu command IDs live in 0x7000-0x7FFF (shell32 menu resource
 // 215 uses up to 0x7B03); this range is unused there.
 constexpr UINT kHistoryParentId = 0x7E00;
@@ -964,15 +939,15 @@ static int FindItemPos(HMENU menu, UINT id) {
     return -1;
 }
 
-static void AddHistoryMenu(HMENU menu, UINT idAdjust) {
+static void AddHistoryMenu(HMENU menu) {
     if (!DefView_OnCommand_Original)
-        return;  // couldn't hook the command handler; clicks would do nothing
+        return;  // clicks couldn't be handled
     if (GetMenuState(menu, kHistoryParentId, MF_BYCOMMAND) != (UINT)-1)
         DeleteMenu(menu, kHistoryParentId, MF_BYCOMMAND);
 
-    int pos = FindItemPos(menu, kRedoItemId + idAdjust);
+    int pos = FindItemPos(menu, kRedoItemId);
     if (pos < 0)
-        pos = FindItemPos(menu, kUndoItemId + idAdjust);
+        pos = FindItemPos(menu, kUndoItemId);
     if (pos < 0)
         return;
 
@@ -1047,7 +1022,7 @@ static void AddHistoryMenu(HMENU menu, UINT idAdjust) {
 void* __cdecl ContextMenuOnHMENU_ctor_Hook(void* pThis, HMENU menu,
                                            HWND hwnd) {
     if (g_settings.historyMenu && menu)
-        AddHistoryMenu(menu, 0);  // no-op unless the menu has Undo/Redo
+        AddHistoryMenu(menu);  // no-op unless the menu has Undo/Redo
     return ContextMenuOnHMENU_ctor_Original(pThis, menu, hwnd);
 }
 
@@ -1103,11 +1078,8 @@ static bool HandleHistoryCommand(UINT id) {
         return false;
     }
 
-    std::wstring log;
     bool proceed = undopreview::ConfirmSteps(job->steps, job->redo,
-                                             OwnerWindow(), DialogOpts(), &log);
-    Wh_Log(L"History %s x%zu: %s", job->redo ? L"redo" : L"undo",
-           job->steps.size(), proceed ? L"proceed" : L"cancelled");
+                                             OwnerWindow(), DialogOpts());
     if (!proceed) {
         delete job;
         return true;
@@ -1125,11 +1097,9 @@ static bool HandleHistoryCommand(UINT id) {
 __int64 __cdecl DefView_OnCommand_Hook(void* pThis, unsigned __int64 wParam,
                                        __int64 lParam) {
     UINT id = LOWORD(wParam);
-    if (id >= kHistoryFirstId && id <= kHistoryLastId) {
-        Wh_Log(L"History command 0x%X", id);
-        if (HandleHistoryCommand(id))
-            return 0;
-    }
+    if (id >= kHistoryFirstId && id <= kHistoryLastId &&
+        HandleHistoryCommand(id))
+        return 0;
     return DefView_OnCommand_Original(pThis, wParam, lParam);
 }
 
@@ -1144,14 +1114,11 @@ static void LoadSettings() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init");
     LoadSettings();
 
     HMODULE shell32 = LoadLibraryW(L"shell32.dll");
-    if (!shell32) {
-        Wh_Log(L"shell32.dll not loaded");
+    if (!shell32)
         return FALSE;
-    }
 
     WindhawkUtils::SYMBOL_HOOK shell32Hooks[] = {
         {
@@ -1194,9 +1161,5 @@ BOOL Wh_ModInit() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-}
-
-void Wh_ModUninit() {
-    Wh_Log(L"Uninit");
 }
 #endif  // UNDO_PREVIEW_STANDALONE

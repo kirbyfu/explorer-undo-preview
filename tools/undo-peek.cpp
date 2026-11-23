@@ -1,9 +1,9 @@
-// Standalone test tool for the Explorer Undo Preview decoder.
-// Reads Explorer's undo/redo stack from outside Explorer and prints what each
-// entry would do. Build with tools/build.ps1.
+// Prints Explorer's undo/redo stack from outside Explorer, using the mod's
+// decoder. Build with tools/build.ps1.
 //
 //   undo-peek            list the undo stack
 //   undo-peek --redo     list the redo stack
+//   undo-peek --items    also print the decoded fields of each item
 //   undo-peek --raw      also hex-dump each serialized entry
 //   undo-peek --dialog   show the confirmation dialog for the top entry
 
@@ -23,52 +23,6 @@ static void HexDump(const std::vector<BYTE>& b) {
     }
 }
 
-static void DumpMenu(HMENU m, int depth) {
-    int n = GetMenuItemCount(m);
-    for (int i = 0; i < n; i++) {
-        WCHAR text[256] = L"";
-        MENUITEMINFOW mii = {sizeof(mii)};
-        mii.fMask = MIIM_ID | MIIM_STRING | MIIM_SUBMENU | MIIM_FTYPE | MIIM_STATE;
-        mii.dwTypeData = text;
-        mii.cch = ARRAYSIZE(text);
-        GetMenuItemInfoW(m, i, TRUE, &mii);
-        for (WCHAR* p = text; *p; p++)
-            if (*p == L'\t') *p = L'|';
-        wprintf(L"%*ls[%2d] id=0x%04x %ls%ls%ls\n", depth * 4, L"", i, mii.wID,
-                (mii.fType & MFT_SEPARATOR) ? L"----" : text,
-                (mii.fState & MFS_DISABLED) ? L"  (disabled)" : L"",
-                mii.hSubMenu ? L"  >" : L"");
-        if (mii.hSubMenu)
-            DumpMenu(mii.hSubMenu, depth + 1);
-    }
-}
-
-// Builds a folder's background context menu the way Explorer's view does
-// (IShellFolder::CreateViewObject -> CDefFolderMenu) and prints it.
-static int DumpBackgroundMenu(const wchar_t* folder) {
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    IShellFolder* sf = nullptr;
-    IContextMenu* cm = nullptr;
-    HRESULT hr = SHParseDisplayName(folder, nullptr, &pidl, 0, nullptr);
-    if (SUCCEEDED(hr))
-        hr = SHBindToObject(nullptr, pidl, nullptr, IID_PPV_ARGS(&sf));
-    if (SUCCEEDED(hr))
-        hr = sf->CreateViewObject(nullptr, IID_PPV_ARGS(&cm));
-    if (FAILED(hr)) {
-        wprintf(L"failed: 0x%08X\n", (unsigned)hr);
-        return 2;
-    }
-    HMENU m = CreatePopupMenu();
-    hr = cm->QueryContextMenu(m, 0, 1, 0x7fff, CMF_NORMAL);
-    wprintf(L"QueryContextMenu: 0x%08X\n", (unsigned)hr);
-    DumpMenu(m, 0);
-    DestroyMenu(m);
-    cm->Release();
-    sf->Release();
-    CoTaskMemFree(pidl);
-    return 0;
-}
-
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U8TEXT);
     bool redo = false, raw = false, dialog = false, items = false;
@@ -79,10 +33,6 @@ int wmain(int argc, wchar_t** argv) {
         else if (!lstrcmpiW(argv[i], L"--items")) items = true;
     }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    for (int i = 1; i + 1 < argc; i++)
-        if (!lstrcmpiW(argv[i], L"--menu"))
-            return DumpBackgroundMenu(argv[i + 1]);
 
     if (dialog) {
         LoadLibraryW(L"comctl32.dll");  // v6 via manifest -> TaskDialogIndirect
@@ -99,7 +49,7 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"Could not open the undo manager: 0x%08X\n", (unsigned)hr);
         return 2;
     }
-    wprintf(L"%ls stack: %zu entr%ls (in enumeration order)\n\n",
+    wprintf(L"%ls stack: %zu entr%ls, next first\n\n",
             redo ? L"Redo" : L"Undo", entries.size(),
             entries.size() == 1 ? L"y" : L"ies");
     for (size_t i = 0; i < entries.size(); i++) {
